@@ -1,0 +1,132 @@
+name: Tourism Package Prediction Pipeline
+
+on:
+  push:
+    branches:
+      - main            # runs automatically on every push to main
+  workflow_dispatch:    # also allows a manual run from the Actions tab
+
+# Required so the training job can commit the trained model back to the repository
+permissions:
+  contents: write
+
+jobs:
+
+  # ---------------------------------------------------------------- 1. REGISTER
+  register-dataset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      - name: Register Dataset
+        run: python tourism_project/model_building/data_register.py
+
+      - name: Upload Registered Dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: registered-data
+          path: tourism_project/data/tourism.csv
+
+  # ------------------------------------------------------------ 2. PREPARATION
+  data-prep:
+    needs: register-dataset          # only runs if validation passed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      - name: Run Data Preparation
+        run: python tourism_project/model_building/prep.py
+
+      # The splits are passed to the training job as a workflow artifact,
+      # since each job runs on a fresh machine
+      - name: Upload Train Test Splits
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-splits
+          retention-days: 7
+          path: |
+            Xtrain.csv
+            Xtest.csv
+            ytrain.csv
+            ytest.csv
+
+  # -------------------------------------------------------------- 3. TRAINING
+  model-traning:
+    needs: data-prep                 # only runs if preparation succeeded
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      # Retrieves the splits produced by the previous job
+      - name: Download Train Test Splits
+        uses: actions/download-artifact@v4
+        with:
+          name: data-splits
+
+      # Started in the background so it stays alive for the training step.
+      # The loop waits for it to answer instead of guessing a fixed sleep --
+      # train.py falls back to a local store if it never comes up.
+      - name: Start MLflow Server
+        run: |
+          nohup mlflow ui --host 0.0.0.0 --port 5000 > mlflow.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:5000 > /dev/null; then
+              echo "MLflow server is up after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Model Building
+        run: python tourism_project/model_building/train.py
+
+      # Keeps the MLflow run history as downloadable evidence of the tuning
+      - name: Upload MLflow Runs
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-runs
+          path: |
+            mlruns/
+            mlflow.db
+        continue-on-error: true
+
+      # Commits the trained model to main so Streamlit Cloud can load it.
+      # '[skip ci]' stops this commit from re-triggering the workflow.
+      # The notebook pushes files one at a time, so main can move forward while
+      # this job is training. The rebase-and-retry loop replays the model commit
+      # on top of whatever arrived, instead of letting the push be rejected.
+      - name: Commit Trained Model
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add tourism_project/deployment/best_tourism_model_v1.joblib
+          git add tourism_project/deployment/metrics.json
+          git commit -m "Add trained model [skip ci]" || { echo "No changes to commit"; exit 0; }
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin main && git push origin HEAD:main; then
+              echo "Model committed on attempt $attempt"
+              exit 0
+            fi
+            echo "Push attempt $attempt failed, retrying in 5s..."
+            sleep 5
+          done
+          echo "Could not push after 3 attempts"
+          exit 1
